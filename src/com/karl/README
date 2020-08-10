@@ -1,0 +1,220 @@
+********************************************************************************
+Set up
+********************************************************************************
+The code is in src/com/karl/Application.java
+
+The Application uses "org.apache.commons.cli". commons-cli-1.4.jar is included
+in src/ and can be added to CLASSPATH.
+
+To compile:
+
+     javac -cp $CLASSPATH:commons-cli-1.4.jar com/karl/Application.java
+
+********************************************************************************
+Running
+********************************************************************************
+From src:
+
+     java -cp $CLASSPATH:commons-cli-1.4.jar com/karl/Application <options>
+
+     usage: Application
+      -c,--connections <arg>   maxumum # of simultaneous connections
+      -f,--fakeconsumer        run with a fake (local) consumer for stress
+                               testing algorithm
+      -l,--log <arg>           log file name
+      -p,--port <arg>          server socket port
+
+Alternatively you can run without compiling:
+
+     java -cp $CLASSPATH:commons-cli-1.4.jar com/karl/Application.java <options>
+
+The default values for the parameters:
+
+    port = 4000
+    connections = 5
+    log = "numbers.log"
+
+********************************************************************************
+Decisions
+********************************************************************************
+--------------------------------------------------------------------------------
+  The socket connections methodology
+--------------------------------------------------------------------------------
+I chose to create the server socket with a backlog of 5, because I misread the
+docs and thought that meant the maximum number of connections was 5, rather than
+only 5 requests can be waiting while you are currently servicing others. My
+testing tool opened connectios so quickly that *usually* 5 got in right away and
+others were rejected, but I occasionally noticed that there were 6 or efen 7
+open connections.  Byt he time I figured this out, it was too late to go back
+and fix it.
+
+What I should have done was made a connection pool of Sockets and only
+accept()ed new connections if there were a Socket available.
+
+--------------------------------------------------------------------------------
+  The socket reading methodology
+--------------------------------------------------------------------------------
+I chose a simple, brute force approach of using a DataInputStream.readFully() to
+grab 10 bytes at a time.  This does constrain us to only using 9-digit numbers
+or the word "terminate" followed by a server-specific new line, so tweaking
+the size of the numbers or the terminate signal is not possible.
+
+This also leads to a race condition where a producer writes less than 10 bytes
+on the socket and then sits there with the socket open, but never writes
+anything else:  This would tie up the socket.  In the worst case scenario, *all*
+producers could do this and tie up all of the sockets, and no other producer
+would be able to connect, amd therefore no "terminate" signal could ever be
+sent, thus hanging the entire system.
+
+I have currently "fixed" this by giving the Sockets a timeout, but there's
+probably a better way.
+
+--------------------------------------------------------------------------------
+  The Queue for collecting numbers to be processed
+--------------------------------------------------------------------------------
+Originally I chose ConcurrentLinkedQueue as it seemed plausible as non-blocking
+and being all cool and CAS-y, but I ended up having to write an exponential
+backoff as there were a lot of unnecessary poll() calls which return null when
+the queue is empty.
+
+I then switched to LinkedBlockingQueue, which deals with the multiple producers
+for me, and yet does block on the take() from the consumer, which is okay as we
+only have a single consumer, thus avoiding all the unnecessary poll() calls.
+The only problem then was how to stop the consumer when the queue is empty and
+it's hanging on take().  As we are dealing with positive 9-digit numbers, I
+simply added a negative number onto the queue when receiving a terminate, and
+when take() returns a negative number, we are done with the queue.  This was
+much cleaner that the exponential backoff.
+
+--------------------------------------------------------------------------------
+  BitSet for storing unique numbers
+--------------------------------------------------------------------------------
+I decided to use a BitSet to "store" the unique numbers for several reasons:
+
+Pros:
+
+1. Quick checking for existence of a number
+2. Potentially smaller memory footprint: Assuming an efficient implementation of
+BitSet, 1 billion bits should take up about 120 MB.  Storing the actualy
+numbers as 32-bit integers would mean that 31.25 million unique numbers would
+take up the "same" amount of space in some sort of cache.  Given that we want a
+throughput aroud 2M numbers/10 seconds, we would potentially hit this number
+after running for 3 minutes or so.
+
+Cons:
+1. Potentially wasteful of memory: Short runs with less than 32M unique numbers
+would mean using more space than is necessaary. Hmm, maybe some sort of
+SparseLongArray ...
+Or (and this would easily enable multiple consumers) the space could be divided
+into smaller BitSets, say ten 100 million ones, and they could be created only
+when we got a unique number which landed there (and there could be one
+consumer for each BitSet)...
+
+********************************************************************************
+Testing
+********************************************************************************
+--------------------------------------------------------------------------------
+  Testing Client
+--------------------------------------------------------------------------------
+I wrote a Client which generates random integers between 0 and 999999999,
+then writes them to the socket padded with leading zeroes. You can specify the
+port, the number of producers to spawn, and how many numbers to generate (per
+producer).  The Client code is not as clean, alas.
+
+To run the client:
+
+    java com/karl/Client.java <port> <numSessions> <numNums>
+    port - socket port
+    numSessions - how many producerss to start
+    numNums - how many sets of 100 numbers to generate
+
+The Client was never performant enough, so ended up generatint 1 random number
+and add 1 to 99 to it, for a total of 100 numbers, and then writing them all
+at once.
+
+To run a client to send a "terminate", choose 0 sessions (numNums is ignored):
+
+    java com/karl/Client.java <port> 0 <numNums>
+    
+
+--------------------------------------------------------------------------------
+  Fake producer for stress testing
+--------------------------------------------------------------------------------
+My poor old laptop could not seem to produce numbers fast enough (a "good"
+speed was producing 2M numbers in 23 seconds, and the consumer kept pace),
+so I made the consumer an interface and implemented a "fake" comsumer which,
+instead of reading randomly generated numbers over sockets, generates its own
+random numbers and shoves them onto the queue for processing by the number
+cruncher. This stress tests both the NumberStore (write-wise) and the number
+crunching (check the queue, check for uniqueness, store unique numbers, write
+unique numbers).
+
+The Application "produced" 4M numbers and wrote 3,992,113 unique ones out in
+about 4 seconds with the command:
+
+    java com/karl/Application.java -f
+
+This currently still waits for a client to run as it hangs on the socket
+accept(), which oyu can trigger with a "terminate" client:
+
+    java com/karl/Client.java 4000 0 0
+
+--------------------------------------------------------------------------------
+  Other tests I ran
+--------------------------------------------------------------------------------
+I meant to clean up Client.java and give it all sorts of fancy command line
+parameters, but I ran out of time.  I ended up quickly hacking the
+sendRandomData() code to test various things.
+
+These close the connection as bad data received:
+
+  1. Send "terminate" after sending number(s)
+  2. Send bad newlines
+  3. Send wrong length lines
+  4. Send numbers with leading spaces instead of zeroes
+  5. Send correct length lines with non-numerioc data
+  
+I also set up a scenario where clients could only write 5 characters and then
+sleep for 30 seconds.  This caused the sockets to be tied up for 30 seconds
+until I added the socket timeout.
+
+********************************************************************************
+Thoughts:
+********************************************************************************
+Added a potential "maxnum" parameter to allow modifying the "size" of the
+numbers:
+
+      maxnum = 1,000,000,000 -> 9-digit numbers
+      maxnum =   100,000,000 -> 8-digit numbers
+         ...
+      maxnum =         1,000 -> 3-digit numbers
+
+
+********************************************************************************
+Unfinished:
+********************************************************************************
+0. Clean up code more
+1. Check for valid log file name
+2. "Flush" the log file periodically to prevent data loss
+3. Refactor some of the classes in Application.java to their own files (i.e.
+   consumer, producer, and number cruncher).
+4. Write out the BitSet occasionally in case of catastrophic failure?  Seems
+   excessive and might take more time than it's worth.  Plus when the Application
+   starts, we don't recover data, but just start anew; maybe we might want a
+   "recovery" mode some day ...
+5. Make this a proper README.md and provide a PDF version
+
+
+********************************************************************************
+Regrets :-P
+********************************************************************************
+I stumbled upon "org.apache.commons.cli" and started implementing it; I think
+there might be something nicer out there...
+
+I didn't scrape enough rust off of my Java skills before attempting the
+challenge, so I wasted a lot of time making silly mistakes and relearning
+stuff.
+
+Not setting up an IDE on my laptop.  This made life much harder/slower using
+just emacs, javac, and java.  There are also probably many unused imports and
+variables that an IDE would kindly inform me of.
